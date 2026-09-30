@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto';
+import path from 'node:path';
 import request from 'supertest';
 import { createApp } from '../src/app';
 import { SecretBox } from '../src/crypto/secretBox';
+import { ChangeHub, type BoardChange } from '../src/events/changes';
 import type { EventPublisher, QueuedEvent } from '../src/events/publisher';
 import { signPayload } from '../src/provider/webhookSignature';
 import {
@@ -114,13 +116,18 @@ export function providerMessage(overrides: Partial<ProviderMessage> = {}): Provi
   };
 }
 
-export function buildTestApp(options: { cacheTtlMs?: number } = {}) {
+export const PUBLIC_DIR = path.resolve(__dirname, '../public');
+
+export function buildTestApp(options: { cacheTtlMs?: number; streamHeartbeatMs?: number } = {}) {
   const clock = { current: new Date('2026-01-01T10:00:00Z') };
   const now = () => clock.current;
   const provider = new FakeProvider();
   const publisher = new FakePublisher();
-  const integrationRepo = new InMemoryIntegrationRepository();
-  const cache = new InMemoryBoardCache();
+  const changes = new ChangeHub();
+  const emitted: BoardChange[] = [];
+  changes.subscribe((c) => emitted.push(c));
+  const integrationRepo = new InMemoryIntegrationRepository((c) => changes.emit(c));
+  const cache = new InMemoryBoardCache((c) => changes.emit(c));
   const eventRepo = new InMemoryEventRepository(cache);
   const sends = new InFlightSends();
 
@@ -143,6 +150,9 @@ export function buildTestApp(options: { cacheTtlMs?: number } = {}) {
     integrations,
     conversations,
     events,
+    changes,
+    staticDir: PUBLIC_DIR,
+    streamHeartbeatMs: options.streamHeartbeatMs,
     webhookSecret: WEBHOOK_SECRET,
     internalApiToken: INTERNAL_TOKEN,
   });
@@ -152,7 +162,21 @@ export function buildTestApp(options: { cacheTtlMs?: number } = {}) {
   };
   const connect = () => request(app).post('/integrations/connect').send(validCredentials).expect(201);
 
-  return { app, clock, advance, provider, publisher, integrationRepo, cache, eventRepo, events, sends, connect };
+  return {
+    app,
+    clock,
+    advance,
+    provider,
+    publisher,
+    integrationRepo,
+    cache,
+    eventRepo,
+    events,
+    sends,
+    changes,
+    emitted,
+    connect,
+  };
 }
 
 export function signedWebhook(app: Parameters<typeof request>[0], event: unknown, secret = WEBHOOK_SECRET) {
