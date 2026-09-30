@@ -1,6 +1,6 @@
 # board-api
 
-Backend for the communication board. It owns the Sprintle/Twilio connect/disconnect
+Backend for the communication board, plus the board UI it serves at `/`. It owns the Sprintle/Twilio connect/disconnect
 lifecycle, the conversation/message cache in **board-db** (PostgreSQL), conversation
 status changes, search/filter, every call out to Sprintle/Twilio, and the
 webhook → Kafka → cache pipeline. It is the only component that holds provider
@@ -22,6 +22,11 @@ Depends on: `CMP-001` communication-board-ui, `CMP-003` sprintle-twilio-api,
 | OP-007 | `PATCH /conversations/{id}/status`       | `200 { conversation }` | `400`, `404`, `409 INVALID_STATUS_TRANSITION` |
 | OP-008 | `POST /webhooks/sprintle-twilio/events`  | `202 { eventId }` (`200` on a duplicate) | `400`, `401 INVALID_SIGNATURE`, `503 EVENT_PUBLISH_FAILED` |
 | OP-009 | `POST /internal/events/{eventId}/process`| `200 { eventId, outcome }` | `401 UNAUTHENTICATED`, `404 EVENT_NOT_FOUND` |
+| —      | `GET /conversations/stream`              | `text/event-stream` of `change` events | none |
+
+`message` is `{ id, conversationId, providerMessageId, direction, author, recipient, body, status, createdAt, updatedAt }`:
+`author` is the sender and `recipient` the receiver. For inbound messages the recipient is the agent side
+(`Agent` unless the provider names one); for outbound messages it is the conversation participant.
 
 Errors use one shape: `{ "error": { "code", "message", "details?" } }`.
 
@@ -67,12 +72,70 @@ Errors use one shape: `{ "error": { "code", "message", "details?" } }`.
 Handled event types: `conversation.created`, `conversation.updated`, `message.created`,
 `message.updated`. Other types are acknowledged and ignored.
 
+### Live updates
+
+`GET /conversations/stream` is a Server-Sent Events stream. Every cache write sends a
+`pg_notify('board_changes', …)`: a new or updated conversation, a new message, a status
+change, or an integration change. Inside the consumer's transaction, Postgres only
+delivers the notification once the transaction commits. Each API replica `LISTEN`s and
+forwards the change to its open streams as
+`{ type: 'conversation.changed' | 'message.changed' | 'integration.changed', … }`.
+A conversation that arrives by webhook therefore appears on every open board without a
+page refresh. If the stream drops, the UI falls back to polling every 15 seconds.
+
+## Board UI (`public/`)
+
+Plain ES modules with no build step, served by board-api at `/`:
+
+- **Board and list views.** Open / In Progress / Resolved columns, or a list. Switching
+  views keeps the selected conversation, and each conversation keeps its own reply draft.
+- **Connection status badge.** Green *Connected*, grey *Disconnected* / *Not connected*,
+  red *Connection error* with the provider's error. It updates live from
+  `integration.changed`.
+- **Search and status filter.** A search with no matches shows a "No matching
+  conversations" empty state with a *Clear filters* button, not an error.
+- **Loading, empty and error states.** A loading indicator shows while data is fetched,
+  and an empty state when there are no conversations. When a call fails, a clear error
+  banner appears with *Retry*, and the board keeps showing the last loaded data. When the
+  provider is down, a notice says the data may be out of date.
+- **Messages.** Each message shows sender → receiver, content, timestamp and a status
+  (Received / Sending / Sent / Delivered / Failed / Cancelled).
+- **Sending.** A failed send keeps the draft in the composer and says why.
+
+The page is served with `Content-Security-Policy: connect-src 'self'`, so the browser
+can only reach board-api. The UI's API client (`public/js/api.js`) accepts only relative,
+same-origin paths.
+
+### Request flow (REQ-009)
+
+```
+Board UI (browser) ──same-origin only──▶ board-api ──HTTPS, Basic auth──▶ Sprintle/Twilio API ──▶ Communication Service
+        ▲                                   │  ▲                                  │
+        └──── SSE /conversations/stream ────┘  └── signed webhook → Kafka → worker ┘
+```
+
+The UI never holds provider credentials or calls the provider. Only board-api does, in
+`src/provider/httpClient.ts`. Sprintle/Twilio's link to the underlying Communication
+Service is on the provider's side of the `CMP-003` contract, so this repo can't test it.
+
+## Requirement coverage
+
+| Requirement | Where | Tests |
+|-------------|-------|-------|
+| REQ-002 board view, selection kept across views, new conversations appear live | `public/js/view.js`, `public/js/controller.js`, `src/routes/stream.ts`, `src/events/pgListener.ts` | `tests/ui/board.dom.test.ts`, `tests/realtime.test.ts` |
+| REQ-003 sender, receiver, content, timestamp, status per message | `db/migrations/005_add_message_recipient.sql`, `src/domain.ts`, `public/js/view.js` | `tests/realtime.test.ts`, `tests/ui/board.dom.test.ts` |
+| REQ-006 search and filters, empty state for no results | `src/repositories/postgres.ts`, `public/js/state.js` | `tests/conversations.test.ts`, `tests/realtime.test.ts`, `tests/ui/*.test.ts` |
+| REQ-007 connected / disconnected / error indicator | `src/services/integrationService.ts`, `public/js/state.js` | `tests/integrations.test.ts`, `tests/ui/state.test.ts`, `tests/ui/board.dom.test.ts` |
+| REQ-008 loading, empty, clear errors without breaking the board | `src/services/conversationService.ts`, `public/js/controller.js`, `public/js/view.js` | `tests/realtime.test.ts`, `tests/ui/board.dom.test.ts` |
+| REQ-009 UI → board-api → Sprintle/Twilio only | `src/app.ts` (CSP), `public/js/api.js`, `src/provider/httpClient.ts` | `tests/realtime.test.ts`, `tests/ui/api.test.ts`, `tests/unit.test.ts` |
+
 ## Running locally
 
 ```bash
 cp .env.example .env
 export CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)
 docker compose up --build        # board-db, Kafka, migrations, board-api on :3000, board-worker
+open http://localhost:3000       # the board UI
 ```
 
 Or without Docker for the API:
@@ -105,7 +168,7 @@ npm run dev:worker   # Kafka consumer + outbox relay
 ## Tests
 
 ```bash
-npm test          # vitest + supertest against in-memory repositories and a fake provider
+npm test          # API tests (vitest + supertest, in-memory repos, fake provider) and UI tests (jsdom)
 npm run typecheck
 ```
 
