@@ -1,0 +1,78 @@
+x-board-env: &board-env
+  DATABASE_URL: postgres://board:board@board-db:5432/board
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC: conversation-events
+  SPRINTLE_API_BASE_URL: ${SPRINTLE_API_BASE_URL:-http://host.docker.internal:4010}
+  SPRINTLE_WEBHOOK_SECRET: ${SPRINTLE_WEBHOOK_SECRET:-change-me}
+  CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?set CREDENTIALS_ENCRYPTION_KEY (openssl rand -base64 32)}
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me}
+
+services:
+  board-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: board
+      POSTGRES_PASSWORD: board
+      POSTGRES_DB: board
+    ports:
+      - "5433:5432"
+    volumes:
+      - board-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U board -d board"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 6
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  board-migrate:
+    build: .
+    command: ["node", "dist/scripts/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://board:board@board-db:5432/board
+    depends_on:
+      board-db:
+        condition: service_healthy
+
+  board-api:
+    build: .
+    environment:
+      <<: *board-env
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      board-migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+
+  board-worker:
+    build: .
+    command: ["node", "dist/src/worker.js"]
+    environment: *board-env
+    depends_on:
+      board-migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+
+volumes:
+  board-db-data:
