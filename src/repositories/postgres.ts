@@ -1,5 +1,14 @@
 import type { Pool, PoolClient } from 'pg';
-import type { Conversation, ConversationStatus, Integration, Message, MessageStatus, ProviderEventRecord } from '../domain';
+import {
+  BOARD_IDENTITY,
+  type Conversation,
+  type ConversationStatus,
+  type Integration,
+  type Message,
+  type MessageStatus,
+  type ProviderEventRecord,
+} from '../domain';
+import { CHANGE_CHANNEL, type BoardChange } from '../events/changes';
 import type { ProviderConversation, ProviderMessage } from '../provider/types';
 import type {
   BoardCache,
@@ -13,6 +22,11 @@ import type {
 type Queryable = Pool | PoolClient;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Inside a transaction, Postgres delivers the notification only if the transaction commits. */
+async function notify(db: Queryable, change: BoardChange): Promise<void> {
+  await db.query('SELECT pg_notify($1, $2)', [CHANGE_CHANNEL, JSON.stringify(change)]);
+}
 
 interface IntegrationRow {
   id: string;
@@ -43,6 +57,7 @@ interface MessageRow {
   provider_message_id: string | null;
   direction: 'inbound' | 'outbound';
   author: string;
+  recipient: string;
   body: string;
   status: MessageStatus;
   created_at: Date;
@@ -88,6 +103,7 @@ const toMessage = (r: MessageRow): Message => ({
   providerMessageId: r.provider_message_id,
   direction: r.direction,
   author: r.author,
+  recipient: r.recipient,
   body: r.body,
   status: r.status,
   createdAt: r.created_at,
@@ -145,15 +161,17 @@ export class PostgresIntegrationRepository implements IntegrationRepository {
          VALUES ($1, $2, 'connected', $3, $3) RETURNING *`,
         [input.accountSid, input.credentialsCiphertext, now],
       );
+      await notify(client, { type: 'integration.changed' });
       return toIntegration(rows[0]);
     });
   }
 
   async deactivate(id: string, now: Date): Promise<void> {
-    await this.pool.query(
+    const { rowCount } = await this.pool.query(
       `UPDATE integrations SET status = 'disconnected', disconnected_at = $2 WHERE id = $1 AND status = 'connected'`,
       [id, now],
     );
+    if (rowCount) await notify(this.pool, { type: 'integration.changed' });
   }
 
   async recordSync(id: string, result: { at: Date } | { error: string }): Promise<void> {
@@ -162,6 +180,7 @@ export class PostgresIntegrationRepository implements IntegrationRepository {
     } else {
       await this.pool.query('UPDATE integrations SET last_error = $2 WHERE id = $1', [id, result.error]);
     }
+    await notify(this.pool, { type: 'integration.changed' });
   }
 }
 
@@ -170,7 +189,7 @@ class PostgresCacheWriter implements CacheWriter {
   constructor(protected readonly db: Queryable) {}
 
   async upsertConversation(c: ProviderConversation, now: Date): Promise<void> {
-    await this.db.query(
+    const { rowCount } = await this.db.query(
       `INSERT INTO conversations
          (id, title, participant, last_message_preview, last_message_at, provider_updated_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -181,42 +200,52 @@ class PostgresCacheWriter implements CacheWriter {
          last_message_at = EXCLUDED.last_message_at,
          provider_updated_at = EXCLUDED.provider_updated_at,
          updated_at = EXCLUDED.updated_at
-       WHERE conversations.provider_updated_at <= EXCLUDED.provider_updated_at`,
+       WHERE conversations.provider_updated_at <= EXCLUDED.provider_updated_at
+       RETURNING id`,
       [c.id, c.title, c.participant, c.lastMessagePreview, c.lastMessageAt, c.updatedAt, now],
     );
+    if (rowCount) await notify(this.db, { type: 'conversation.changed', conversationId: c.id });
   }
 
   async upsertMessage(m: ProviderMessage, now: Date): Promise<boolean> {
-    const { rowCount } = await this.db.query('SELECT 1 FROM conversations WHERE id = $1', [m.conversationId]);
-    if (!rowCount) return false;
+    const conv = await this.db.query<{ participant: string }>('SELECT participant FROM conversations WHERE id = $1', [
+      m.conversationId,
+    ]);
+    if (!conv.rows[0]) return false;
+    const recipient = m.recipient ?? (m.direction === 'outbound' ? conv.rows[0].participant : BOARD_IDENTITY);
 
     // Our own outgoing row, matched by the clientRef we sent with it.
-    let matched = false;
+    let messageId: string | null = null;
     if (m.clientRef && UUID_RE.test(m.clientRef)) {
-      const res = await this.db.query(
+      const res = await this.db.query<{ id: string }>(
         `UPDATE messages SET provider_message_id = $2, status = $3, provider_updated_at = $4, updated_at = $5
-         WHERE id = $1 AND (provider_updated_at IS NULL OR provider_updated_at <= $4)`,
+         WHERE id = $1 AND (provider_updated_at IS NULL OR provider_updated_at <= $4)
+         RETURNING id`,
         [m.clientRef, m.id, m.status, m.updatedAt, now],
       );
-      matched = (res.rowCount ?? 0) > 0;
-      if (!matched) {
+      messageId = res.rows[0]?.id ?? null;
+      if (!messageId) {
         const exists = await this.db.query('SELECT 1 FROM messages WHERE id = $1', [m.clientRef]);
         if (exists.rowCount) return true; // cached copy is newer
       }
     }
-    if (!matched) {
-      await this.db.query(
+    if (!messageId) {
+      const res = await this.db.query<{ id: string }>(
         `INSERT INTO messages
-           (conversation_id, provider_message_id, direction, author, body, status, provider_updated_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           (conversation_id, provider_message_id, direction, author, recipient, body, status,
+            provider_updated_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (provider_message_id) DO UPDATE SET
            body = EXCLUDED.body,
            status = EXCLUDED.status,
            provider_updated_at = EXCLUDED.provider_updated_at,
            updated_at = EXCLUDED.updated_at
-         WHERE messages.provider_updated_at IS NULL OR messages.provider_updated_at <= EXCLUDED.provider_updated_at`,
-        [m.conversationId, m.id, m.direction, m.author, m.body, m.status, m.updatedAt, m.createdAt, now],
+         WHERE messages.provider_updated_at IS NULL OR messages.provider_updated_at <= EXCLUDED.provider_updated_at
+         RETURNING id`,
+        [m.conversationId, m.id, m.direction, m.author, recipient, m.body, m.status, m.updatedAt, m.createdAt, now],
       );
+      messageId = res.rows[0]?.id ?? null;
+      if (!messageId) return true; // cached copy is newer
     }
 
     await this.db.query(
@@ -224,6 +253,8 @@ class PostgresCacheWriter implements CacheWriter {
        WHERE id = $1 AND (last_message_at IS NULL OR last_message_at <= $2)`,
       [m.conversationId, m.createdAt, m.body, now],
     );
+    await notify(this.db, { type: 'message.changed', conversationId: m.conversationId, messageId });
+    await notify(this.db, { type: 'conversation.changed', conversationId: m.conversationId });
     return true;
   }
 }
@@ -270,7 +301,9 @@ export class PostgresBoardCache extends PostgresCacheWriter implements BoardCach
       'UPDATE conversations SET status = $2, updated_at = $3 WHERE id = $1 RETURNING *',
       [id, status, now],
     );
-    return rows[0] ? toConversation(rows[0]) : null;
+    if (!rows[0]) return null;
+    await notify(this.pool, { type: 'conversation.changed', conversationId: id });
+    return toConversation(rows[0]);
   }
 
   async markMessagesSynced(conversationId: string, now: Date): Promise<void> {
@@ -286,14 +319,15 @@ export class PostgresBoardCache extends PostgresCacheWriter implements BoardCach
   }
 
   async createOutgoingMessage(
-    input: { conversationId: string; author: string; body: string },
+    input: { conversationId: string; author: string; recipient: string; body: string },
     now: Date,
   ): Promise<Message> {
     const { rows } = await this.pool.query<MessageRow>(
-      `INSERT INTO messages (conversation_id, direction, author, body, status, created_at, updated_at)
-       VALUES ($1, 'outbound', $2, $3, 'sending', $4, $4) RETURNING *`,
-      [input.conversationId, input.author, input.body, now],
+      `INSERT INTO messages (conversation_id, direction, author, recipient, body, status, created_at, updated_at)
+       VALUES ($1, 'outbound', $2, $3, $4, 'sending', $5, $5) RETURNING *`,
+      [input.conversationId, input.author, input.recipient, input.body, now],
     );
+    await notify(this.pool, { type: 'message.changed', conversationId: input.conversationId, messageId: rows[0].id });
     return toMessage(rows[0]);
   }
 
@@ -311,6 +345,7 @@ export class PostgresBoardCache extends PostgresCacheWriter implements BoardCach
       [id, result.status, result.providerMessageId ?? null, now],
     );
     if (!rows[0]) throw new Error(`Message ${id} not found`);
+    await notify(this.pool, { type: 'message.changed', conversationId: rows[0].conversation_id, messageId: id });
     return toMessage(rows[0]);
   }
 }

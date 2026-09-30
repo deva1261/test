@@ -16,6 +16,8 @@ export const providerMessageSchema = z.object({
   conversationId: z.string().min(1),
   direction: z.enum(['inbound', 'outbound']),
   author: z.string(),
+  /** Receiver identity; when absent the cache derives it from direction and participant. */
+  recipient: z.string().nullable().optional(),
   body: z.string(),
   status: z.enum(MESSAGE_STATUSES),
   /** Echo of the `clientRef` we sent, so our local outgoing row can be matched. */

@@ -34,12 +34,18 @@ export interface Message {
   conversationId: string;
   providerMessageId: string | null;
   direction: MessageDirection;
+  /** Sender identity: a phone number/handle for inbound, the agent's name for outbound. */
   author: string;
+  /** Receiver identity: the agent side for inbound, the conversation participant for outbound. */
+  recipient: string;
   body: string;
   status: MessageStatus;
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** How the board itself is identified as a message party when the provider gives no name. */
+export const BOARD_IDENTITY = 'Agent';
 
 export interface ProviderEventRecord {
   id: string;

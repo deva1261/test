@@ -1,5 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import type { Conversation, ConversationStatus, Integration, Message, MessageStatus, ProviderEventRecord } from '../domain';
+import {
+  BOARD_IDENTITY,
+  type Conversation,
+  type ConversationStatus,
+  type Integration,
+  type Message,
+  type MessageStatus,
+  type ProviderEventRecord,
+} from '../domain';
+import type { ChangeListener } from '../events/changes';
 import type { ProviderConversation, ProviderMessage } from '../provider/types';
 import type {
   BoardCache,
@@ -13,6 +22,8 @@ import type {
 /** In-memory implementations used by the test suite. */
 export class InMemoryIntegrationRepository implements IntegrationRepository {
   readonly integrations: Integration[] = [];
+
+  constructor(private readonly onChange: ChangeListener = () => undefined) {}
 
   async findActive(): Promise<Integration | null> {
     const active = this.integrations.find((i) => i.status === 'connected');
@@ -38,12 +49,16 @@ export class InMemoryIntegrationRepository implements IntegrationRepository {
       lastError: null,
     };
     this.integrations.push(record);
+    this.onChange({ type: 'integration.changed' });
     return { ...record };
   }
 
   async deactivate(id: string, now: Date): Promise<void> {
     const i = this.integrations.find((x) => x.id === id);
-    if (i && i.status === 'connected') Object.assign(i, { status: 'disconnected', disconnectedAt: now });
+    if (i && i.status === 'connected') {
+      Object.assign(i, { status: 'disconnected', disconnectedAt: now });
+      this.onChange({ type: 'integration.changed' });
+    }
   }
 
   async recordSync(id: string, result: { at: Date } | { error: string }): Promise<void> {
@@ -51,12 +66,15 @@ export class InMemoryIntegrationRepository implements IntegrationRepository {
     if (!i) return;
     if ('at' in result) Object.assign(i, { lastSyncAt: result.at, lastError: null });
     else i.lastError = result.error;
+    this.onChange({ type: 'integration.changed' });
   }
 }
 
 export class InMemoryBoardCache implements BoardCache {
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, Message & { providerUpdatedAt: Date | null }>();
+
+  constructor(private readonly onChange: ChangeListener = () => undefined) {}
 
   async upsertConversation(c: ProviderConversation, now: Date): Promise<void> {
     const providerUpdatedAt = new Date(c.updatedAt);
@@ -74,6 +92,7 @@ export class InMemoryBoardCache implements BoardCache {
       providerUpdatedAt,
       updatedAt: now,
     });
+    this.onChange({ type: 'conversation.changed', conversationId: c.id });
   }
 
   async upsertMessage(m: ProviderMessage, now: Date): Promise<boolean> {
@@ -94,6 +113,7 @@ export class InMemoryBoardCache implements BoardCache {
       providerMessageId: m.id,
       direction: m.direction,
       author: m.author,
+      recipient: m.recipient ?? existing?.recipient ?? (m.direction === 'outbound' ? conversation.participant : BOARD_IDENTITY),
       body: m.body,
       status: m.status,
       createdAt: existing?.createdAt ?? createdAt,
@@ -103,6 +123,8 @@ export class InMemoryBoardCache implements BoardCache {
     if (!conversation.lastMessageAt || conversation.lastMessageAt <= createdAt) {
       Object.assign(conversation, { lastMessageAt: createdAt, lastMessagePreview: m.body.slice(0, 200), updatedAt: now });
     }
+    this.onChange({ type: 'message.changed', conversationId: m.conversationId, messageId: id });
+    this.onChange({ type: 'conversation.changed', conversationId: m.conversationId });
     return true;
   }
 
@@ -130,6 +152,7 @@ export class InMemoryBoardCache implements BoardCache {
     const c = this.conversations.get(id);
     if (!c) return null;
     Object.assign(c, { status, updatedAt: now });
+    this.onChange({ type: 'conversation.changed', conversationId: id });
     return { ...c };
   }
 
@@ -146,7 +169,7 @@ export class InMemoryBoardCache implements BoardCache {
   }
 
   async createOutgoingMessage(
-    input: { conversationId: string; author: string; body: string },
+    input: { conversationId: string; author: string; recipient: string; body: string },
     now: Date,
   ): Promise<Message> {
     const record = {
@@ -160,6 +183,7 @@ export class InMemoryBoardCache implements BoardCache {
       providerUpdatedAt: null,
     };
     this.messages.set(record.id, record);
+    this.onChange({ type: 'message.changed', conversationId: input.conversationId, messageId: record.id });
     const { providerUpdatedAt: _, ...message } = record;
     return { ...message };
   }
@@ -175,6 +199,7 @@ export class InMemoryBoardCache implements BoardCache {
     if (m.status === 'sending') m.status = result.status;
     m.providerMessageId ??= result.providerMessageId ?? null;
     m.updatedAt = now;
+    this.onChange({ type: 'message.changed', conversationId: m.conversationId, messageId: id });
     const { providerUpdatedAt: _, ...message } = m;
     return { ...message };
   }

@@ -44,7 +44,10 @@ export interface BoardCache extends CacheWriter {
   setConversationStatus(id: string, status: ConversationStatus, now: Date): Promise<Conversation | null>;
   markMessagesSynced(conversationId: string, now: Date): Promise<void>;
   listMessages(conversationId: string): Promise<Message[]>;
-  createOutgoingMessage(input: { conversationId: string; author: string; body: string }, now: Date): Promise<Message>;
+  createOutgoingMessage(
+    input: { conversationId: string; author: string; recipient: string; body: string },
+    now: Date,
+  ): Promise<Message>;
   /** Sets the send outcome only while the row is still `sending`; a provider event may have settled it first. */
   completeOutgoingMessage(
     id: string,

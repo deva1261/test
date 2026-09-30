@@ -1,4 +1,4 @@
-import { STATUS_TRANSITIONS, type Conversation, type ConversationStatus, type Message } from '../domain';
+import { BOARD_IDENTITY, STATUS_TRANSITIONS, type Conversation, type ConversationStatus, type Message } from '../domain';
 import { Errors } from '../errors';
 import { ProviderError } from '../provider/types';
 import type { BoardCache, ConversationFilter } from '../repositories/types';
@@ -19,8 +19,6 @@ export interface ConversationServiceDeps {
   cacheTtlMs: number;
   now?: () => Date;
 }
-
-const DEFAULT_AUTHOR = 'Agent';
 
 export class ConversationService {
   private readonly now: () => Date;
@@ -70,10 +68,14 @@ export class ConversationService {
   async send(conversationId: string, input: { body: string; author?: string }): Promise<Message> {
     const active = await this.deps.integrations.active();
     if (!active) throw Errors.notConnected();
-    if (!(await this.deps.cache.findConversation(conversationId))) throw Errors.conversationNotFound();
+    const conversation = await this.deps.cache.findConversation(conversationId);
+    if (!conversation) throw Errors.conversationNotFound();
 
-    const author = input.author ?? DEFAULT_AUTHOR;
-    const pending = await this.deps.cache.createOutgoingMessage({ conversationId, author, body: input.body }, this.now());
+    const author = input.author ?? BOARD_IDENTITY;
+    const pending = await this.deps.cache.createOutgoingMessage(
+      { conversationId, author, recipient: conversation.participant, body: input.body },
+      this.now(),
+    );
     const flight = this.deps.sends.start();
     try {
       const sent = await active.client.sendMessage(
