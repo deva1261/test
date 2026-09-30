@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import type { Config } from './config';
 import { SecretBox } from './crypto/secretBox';
+import { ChangeHub } from './events/changes';
 import { createKafka, KafkaEventPublisher } from './events/kafka';
 import { httpProviderFactory } from './provider/httpClient';
 import { PostgresBoardCache, PostgresEventRepository, PostgresIntegrationRepository } from './repositories/postgres';
@@ -15,6 +16,7 @@ export function buildContainer(config: Config) {
   const kafka = createKafka(config.kafka);
   const publisher = new KafkaEventPublisher(kafka, config.kafka.topic);
   const sends = new InFlightSends();
+  const changes = new ChangeHub();
 
   const integrations = new IntegrationService({
     integrations: new PostgresIntegrationRepository(pool),
@@ -30,5 +32,5 @@ export function buildContainer(config: Config) {
   });
   const events = new EventService({ events: new PostgresEventRepository(pool), publisher });
 
-  return { pool, kafka, publisher, integrations, conversations, events };
+  return { pool, kafka, publisher, changes, integrations, conversations, events };
 }

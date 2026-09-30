@@ -1,4 +1,4 @@
-import { Kafka, logLevel, type Consumer, type Producer } from 'kafkajs';
+import { Kafka, logLevel, Partitioners, type Consumer, type Producer } from 'kafkajs';
 import { z } from 'zod';
 import type { EventPublisher, QueuedEvent } from './publisher';
 
@@ -21,7 +21,11 @@ export class KafkaEventPublisher implements EventPublisher {
     kafka: Kafka,
     private readonly topic: string,
   ) {
-    this.producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1 });
+    this.producer = kafka.producer({
+      idempotent: true,
+      maxInFlightRequests: 1,
+      createPartitioner: Partitioners.DefaultPartitioner,
+    });
   }
 
   async publish(event: QueuedEvent): Promise<void> {
