@@ -1,0 +1,57 @@
+# Deployed stack (staging / production). Run on the target host via deploy.sh:
+#   APP_ENV=staging IMAGE=ghcr.io/<owner>/<repo>:sha-abc123 ./deploy.sh
+# Non-secret settings come from <APP_ENV>.env; secrets are files under
+# ./secrets/ (never committed) mounted at /run/secrets/*.
+name: authservice-${APP_ENV:?APP_ENV is required}
+
+services:
+  api:
+    image: ${IMAGE:?IMAGE is required}
+    restart: unless-stopped
+    env_file: ${APP_ENV}.env
+    environment:
+      APP_ENV: ${APP_ENV}
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets:
+      - database_url
+    ports:
+      - "${PUBLISH_ADDR:-127.0.0.1:8080}:8080"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "/server", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional single-host Postgres (`--profile bundled-db`). Prefer a managed
+  # Postgres with TLS in production; with this one, set DB_ALLOW_INSECURE=true
+  # in the env file because traffic stays on the private compose network.
+  db:
+    profiles: [bundled-db]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_DB: auth
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth -d auth"]
+      interval: 5s
+      retries: 30
+
+secrets:
+  database_url:
+    file: ./secrets/database_url
+  postgres_password:
+    file: ./secrets/postgres_password
+
+volumes:
+  pgdata:

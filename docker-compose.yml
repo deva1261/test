@@ -17,6 +17,7 @@ services:
   api:
     build: .
     environment:
+      APP_ENV: development
       DATABASE_URL: postgres://auth:auth@db:5432/auth?sslmode=disable
       ADDR: ":8080"
       BCRYPT_COST: "12"
