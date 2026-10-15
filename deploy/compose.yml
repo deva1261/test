@@ -14,6 +14,11 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
     secrets:
       - database_url
+    # Only applies with the bundled-db profile; ignored for an external DB.
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1:8080}:8080"
     read_only: true
