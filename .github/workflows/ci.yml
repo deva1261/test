@@ -53,6 +53,8 @@ jobs:
         run: shellcheck deploy/*.sh
       - name: Validate deploy compose files
         run: make deploy-check
+      - name: Validate Kubernetes manifests (deployment + CPU autoscaler)
+        run: make k8s-check
 
   image:
     needs: test

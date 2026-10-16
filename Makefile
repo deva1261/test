@@ -1,6 +1,15 @@
 TEST_DATABASE_URL ?= postgres://auth:auth@localhost:5433/auth?sslmode=disable
 
-.PHONY: build test test-integration run db-up down vet deploy-check smoke
+KUSTOMIZE_IMAGE ?= registry.k8s.io/kustomize/kustomize:v5.4.3
+KUBECONFORM_IMAGE ?= ghcr.io/yannh/kubeconform:v0.6.7
+
+.PHONY: build test test-integration run db-up down vet deploy-check k8s-check smoke
+
+# Renders deploy/k8s (Deployment + CPU HPA) and validates it against the
+# Kubernetes schemas. Needs only docker.
+k8s-check:
+	bash -o pipefail -c 'docker run --rm -v "$(CURDIR)/deploy/k8s:/k:ro" $(KUSTOMIZE_IMAGE) build /k \
+		| docker run --rm -i $(KUBECONFORM_IMAGE) -strict -summary -'
 
 # Renders the deployed stack for both environments (catches compose/env typos).
 deploy-check:

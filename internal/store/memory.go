@@ -78,6 +78,13 @@ func (m *Memory) GetSessionByTokenHash(_ context.Context, tokenHash string) (*Se
 	return &s, nil
 }
 
+// SessionCount returns the number of stored sessions (test helper; not part of Store).
+func (m *Memory) SessionCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
+}
+
 func (m *Memory) DeleteSessionByTokenHash(_ context.Context, tokenHash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

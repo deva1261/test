@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -35,6 +36,12 @@ type Config struct {
 	CookieSecure    bool
 	DBAllowInsecure bool // permit sslmode=disable in deployed environments
 	ShutdownTimeout time.Duration
+	// Login rate limit per client IP (RSK-001): LoginRateLimit requests per
+	// LoginRateWindow; 0 disables it (development only).
+	LoginRateLimit  int
+	LoginRateWindow time.Duration
+	// TrustedProxies are the peers whose X-Forwarded-For names the client.
+	TrustedProxies []netip.Prefix
 }
 
 // Deployed reports whether the environment is staging or production.
@@ -85,6 +92,18 @@ func LoadFrom(getenv func(string) string, readFile func(string) ([]byte, error))
 	if err != nil {
 		errs = append(errs, fmt.Errorf("DB_ALLOW_INSECURE: %w", err))
 	}
+	c.LoginRateLimit, err = strconv.Atoi(get("LOGIN_RATE_LIMIT", "5"))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("LOGIN_RATE_LIMIT: %w", err))
+	}
+	c.LoginRateWindow, err = time.ParseDuration(get("LOGIN_RATE_WINDOW", "1m"))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("LOGIN_RATE_WINDOW: %w", err))
+	}
+	c.TrustedProxies, err = parsePrefixes(get("TRUSTED_PROXIES", ""))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("TRUSTED_PROXIES: %w", err))
+	}
 	if err := errors.Join(errs...); err != nil {
 		return Config{}, err
 	}
@@ -114,7 +133,16 @@ func (c Config) Validate() error {
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, errors.New("SHUTDOWN_TIMEOUT must be positive"))
 	}
+	if c.LoginRateLimit < 0 {
+		errs = append(errs, errors.New("LOGIN_RATE_LIMIT must be >= 0 (0 disables it)"))
+	}
+	if c.LoginRateWindow <= 0 {
+		errs = append(errs, errors.New("LOGIN_RATE_WINDOW must be positive"))
+	}
 	if c.Deployed() {
+		if c.LoginRateLimit == 0 {
+			errs = append(errs, fmt.Errorf("LOGIN_RATE_LIMIT must be > 0 in %s", c.Env))
+		}
 		if !c.CookieSecure {
 			errs = append(errs, fmt.Errorf("COOKIE_SECURE must be true in %s", c.Env))
 		}
@@ -137,7 +165,35 @@ func (c Config) LogValue() slog.Value {
 		slog.Int("bcrypt_cost", c.BcryptCost),
 		slog.Duration("session_ttl", c.SessionTTL),
 		slog.Bool("cookie_secure", c.CookieSecure),
+		slog.Int("login_rate_limit", c.LoginRateLimit),
+		slog.Duration("login_rate_window", c.LoginRateWindow),
+		slog.Any("trusted_proxies", c.TrustedProxies),
 	)
+}
+
+// parsePrefixes reads a comma-separated list of CIDRs or bare IPs.
+func parsePrefixes(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if !strings.Contains(f, "/") {
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, netip.PrefixFrom(a.Unmap(), a.Unmap().BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }
 
 // Redact hides the password of a postgres URL.

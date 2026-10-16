@@ -1,0 +1,42 @@
+# Kubernetes deployment of auth-api with CPU-driven autoscaling (RSK-001:
+# bcrypt cost 12 makes login CPU-bound). Render / apply:
+#   kubectl kustomize deploy/k8s
+#   kubectl -n auth create secret generic authservice-db --from-file=database_url=./database_url
+#   (cd deploy/k8s && kustomize edit set image authservice=ghcr.io/<owner>/<repo>@sha256:...)
+#   kubectl -n auth apply -k deploy/k8s
+# The HPA needs metrics-server in the cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: authservice
+      app.kubernetes.io/component: auth-api
+    includeSelectors: true
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+
+images:
+  - name: authservice
+    newName: ghcr.io/OWNER/REPO
+    newTag: main
+
+configMapGenerator:
+  - name: authservice-config
+    literals:
+      - APP_ENV=production
+      - ADDR=:8080
+      - BCRYPT_COST=12
+      - SESSION_TTL=12h
+      - COOKIE_SECURE=true
+      - SHUTDOWN_TIMEOUT=20s
+      - DB_ALLOW_INSECURE=false
+      # Per pod: with N replicas a client gets at most N*5 attempts per minute.
+      - LOGIN_RATE_LIMIT=5
+      - LOGIN_RATE_WINDOW=1m
+      # Ingress controller pods; set to your cluster's pod CIDR.
+      - TRUSTED_PROXIES=10.0.0.0/8

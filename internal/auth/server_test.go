@@ -207,6 +207,132 @@ func TestBrowserLoginRedirectsToDashboard(t *testing.T) {
 	}
 }
 
+// ---- WI-003: login ----
+
+func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// WI-003 AC1: valid credentials match the stored user and create a session row.
+func TestLoginCreatesSessionForMatchedUser(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	u, _ := mem.GetUserByEmail(context.Background(), "ada@example.com")
+
+	// Email lookup is case/whitespace-insensitive, like signup.
+	rec := doJSON(t, h, "POST", "/api/auth/login", map[string]string{"email": " ADA@Example.com ", "password": "correct-horse"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control %q", cc)
+	}
+	var body store.Session
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	c := sessionCookie(t, rec)
+	sess, err := mem.GetSessionByTokenHash(context.Background(), HashToken(c.Value))
+	if err != nil {
+		t.Fatalf("session not stored: %v", err)
+	}
+	if sess.UserID != u.ID || body.UserID != u.ID || body.ID != sess.ID || body.TokenHash != sess.TokenHash {
+		t.Fatalf("session %+v body %+v user %s", sess, body, u.ID)
+	}
+	if !sess.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("expires_at %s, want now+TTL", sess.ExpiresAt)
+	}
+	// The raw token only travels in the HttpOnly cookie.
+	if strings.Contains(rec.Body.String(), c.Value) {
+		t.Fatal("raw token leaked in response body")
+	}
+	// Each login issues a fresh token.
+	if c2 := login(t, h, "ada@example.com"); c2.Value == c.Value {
+		t.Fatal("token reused across logins")
+	}
+}
+
+// WI-003 AC2, AC3: wrong password and unknown email are indistinguishable 401s.
+func TestLoginFailuresAreGeneric401(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	var bodies []string
+	for _, body := range []map[string]string{
+		{"email": "ada@example.com", "password": "wrong-password"},
+		{"email": "nobody@example.com", "password": "correct-horse"},
+		{"email": "ada@example.com", "password": ""},
+		{"email": "", "password": ""},
+	} {
+		rec := doJSON(t, h, "POST", "/api/auth/login", body)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%v: got %d, want 401", body, rec.Code)
+		}
+		bodies = append(bodies, rec.Body.String())
+	}
+	for _, b := range bodies {
+		if b != bodies[0] {
+			t.Fatalf("error bodies differ: %q vs %q", b, bodies[0])
+		}
+	}
+	if !strings.Contains(bodies[0], LoginFailedMessage) {
+		t.Fatalf("body %q", bodies[0])
+	}
+	if mem.SessionCount() != 0 {
+		t.Fatal("session created on failed login")
+	}
+}
+
+// WI-003 AC2, AC3: a failed browser login shows the generic message with 401.
+func TestBrowserLoginFailureShowsGenericError(t *testing.T) {
+	_, _, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	var pages []string
+	for _, form := range []url.Values{
+		{"email": {"ada@example.com"}, "password": {"wrong-password"}},
+		{"email": {"nobody@example.com"}, "password": {"correct-horse"}},
+	} {
+		rec := postForm(h, "/api/auth/login", form)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("got %d, want 401", rec.Code)
+		}
+		if rec.Header().Get("Set-Cookie") != "" {
+			t.Fatal("cookie set on failed login")
+		}
+		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") ||
+			!strings.Contains(rec.Body.String(), "Invalid email or password.") {
+			t.Fatalf("page: %q %s", rec.Header().Get("Content-Type"), rec.Body)
+		}
+		pages = append(pages, rec.Body.String())
+	}
+	if pages[0] != pages[1] {
+		t.Fatal("failure page reveals whether the email exists")
+	}
+}
+
+// WI-003 AC4: the session cookie carries HttpOnly, Secure, SameSite and a lifetime.
+func TestLoginCookieAttributes(t *testing.T) {
+	_, _, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"json": doJSON(t, h, "POST", "/api/auth/login", map[string]string{"email": "ada@example.com", "password": "correct-horse"}),
+		"form": postForm(h, "/api/auth/login", url.Values{"email": {"ada@example.com"}, "password": {"correct-horse"}}),
+	} {
+		c := sessionCookie(t, rec)
+		if !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
+			t.Fatalf("%s: cookie %+v", name, c)
+		}
+		if c.MaxAge != int(time.Hour.Seconds()) || len(c.Value) < 43 {
+			t.Fatalf("%s: MaxAge %d len %d", name, c.MaxAge, len(c.Value))
+		}
+	}
+}
+
 func TestMeReturnsCurrentUser(t *testing.T) {
 	_, _, h := newTestServer(t)
 	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
@@ -255,6 +381,125 @@ func TestLogoutClearsCookieAndInvalidatesSession(t *testing.T) {
 	}
 }
 
+// ---- WI-005: logout ----
+
+func postLogout(h http.Handler, contentType, bearer string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "/api/auth/logout", strings.NewReader(""))
+	req.Header.Set("Content-Type", contentType)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// assertCookieCleared checks the response expires the session cookie with
+// the same scope/attributes as the login cookie, so the browser drops it.
+func assertCookieCleared(t *testing.T, name string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	c := sessionCookie(t, rec)
+	if c.Value != "" || c.MaxAge >= 0 || c.Path != "/" || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("%s: cookie not cleared: %+v", name, c)
+	}
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "Max-Age=0") {
+		t.Fatalf("%s: Set-Cookie %q lacks Max-Age=0", name, rec.Header().Get("Set-Cookie"))
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("%s: Cache-Control %q", name, cc)
+	}
+}
+
+// WI-005 AC1 + AC2 for each way a client can log out.
+func TestLogoutVariants(t *testing.T) {
+	cases := map[string]struct {
+		do           func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder
+		wantStatus   int
+		wantLocation string
+	}{
+		"json cookie": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/json", "", c)
+		}, http.StatusOK, ""},
+		"bearer header": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/json", c.Value)
+		}, http.StatusOK, ""},
+		"dashboard form": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/x-www-form-urlencoded", "", c)
+		}, http.StatusSeeOther, "/login"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, mem, h := newTestServer(t)
+			doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+			c := login(t, h, "ada@example.com")
+
+			rec := tc.do(h, c)
+			if rec.Code != tc.wantStatus || rec.Header().Get("Location") != tc.wantLocation {
+				t.Fatalf("got %d Location %q, want %d %q", rec.Code, rec.Header().Get("Location"), tc.wantStatus, tc.wantLocation)
+			}
+			assertCookieCleared(t, name, rec)
+			if mem.SessionCount() != 0 {
+				t.Fatalf("session row kept: %d", mem.SessionCount())
+			}
+			if rec := getMe(h, "Bearer "+c.Value); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("me after logout: got %d, want 401", rec.Code)
+			}
+			if rec := doJSON(t, h, "GET", DashboardPath, nil, c); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("dashboard after logout: got %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+// Logout ends only the presented session; other devices stay signed in.
+func TestLogoutKeepsOtherSessions(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	laptop := login(t, h, "ada@example.com")
+	phone := login(t, h, "ada@example.com")
+
+	if rec := postLogout(h, "application/json", "", laptop); rec.Code != http.StatusOK {
+		t.Fatalf("logout: got %d", rec.Code)
+	}
+	if mem.SessionCount() != 1 {
+		t.Fatalf("got %d sessions, want 1", mem.SessionCount())
+	}
+	if rec := doJSON(t, h, "GET", "/api/auth/me", nil, phone); rec.Code != http.StatusOK {
+		t.Fatalf("other session: got %d, want 200", rec.Code)
+	}
+}
+
+// Logout without a live session is 401, but a stale cookie is still cleared.
+func TestLogoutUnauthenticated(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	c := login(t, h, "ada@example.com")
+
+	cases := map[string]*httptest.ResponseRecorder{
+		"no credentials": postLogout(h, "application/json", ""),
+		"forged cookie":  postLogout(h, "application/json", "", &http.Cookie{Name: CookieName, Value: "forged"}),
+		"forged bearer":  postLogout(h, "application/json", "forged"),
+	}
+	srv.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	cases["expired cookie"] = postLogout(h, "application/json", "", c)
+
+	for name, rec := range cases {
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: got %d, want 401", name, rec.Code)
+		}
+		if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Fatalf("%s: WWW-Authenticate %q", name, rec.Header().Get("WWW-Authenticate"))
+		}
+		assertCookieCleared(t, name, rec)
+	}
+	if mem.SessionCount() != 0 {
+		t.Fatalf("expired session kept: %d rows", mem.SessionCount())
+	}
+}
+
 func TestProtectedRoutesWithoutSession(t *testing.T) {
 	_, _, h := newTestServer(t)
 	for _, r := range []struct{ method, path string }{
@@ -263,6 +508,97 @@ func TestProtectedRoutesWithoutSession(t *testing.T) {
 		if rec := doJSON(t, h, r.method, r.path, nil); rec.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s: got %d, want 401", r.method, r.path, rec.Code)
 		}
+	}
+}
+
+// ---- WI-004: current user ----
+
+func getMe(h http.Handler, header string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", "/api/auth/me", nil)
+	if header != "" {
+		req.Header.Set("Authorization", header)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// WI-004 AC1: the profile is the session's user with no password hash field.
+func TestMeProfileOmitsPasswordHash(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	doJSON(t, h, "POST", "/api/auth/signup", map[string]string{"name": "Bob", "email": "bob@example.com", "password": "correct-horse"})
+	u, _ := mem.GetUserByEmail(context.Background(), "ada@example.com")
+	c := login(t, h, "ada@example.com")
+
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"cookie": doJSON(t, h, "GET", "/api/auth/me", nil, c),
+		"bearer": getMe(h, "Bearer "+c.Value),
+		"BEARER": getMe(h, "bearer "+c.Value),
+	} {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: got %d %s", name, rec.Code, rec.Body)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("%s: content-type %q", name, ct)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Fatalf("%s: Cache-Control %q", name, cc)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 4 || got["id"] != u.ID.String() || got["name"] != "Ada" ||
+			got["email"] != "ada@example.com" || got["created_at"] == nil {
+			t.Fatalf("%s: unexpected body %v", name, got)
+		}
+		for _, k := range []string{"password_hash", "passwordHash", "PasswordHash"} {
+			if _, leaked := got[k]; leaked {
+				t.Fatalf("%s: %s returned", name, k)
+			}
+		}
+		if strings.Contains(rec.Body.String(), u.PasswordHash) {
+			t.Fatalf("%s: hash value leaked", name)
+		}
+	}
+}
+
+// WI-004 AC2: missing, unknown, malformed or expired tokens all get 401.
+func TestMeUnauthenticatedReturns401(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	c := login(t, h, "ada@example.com")
+
+	cases := map[string]*httptest.ResponseRecorder{
+		"no credentials": getMe(h, ""),
+		"unknown cookie": doJSON(t, h, "GET", "/api/auth/me", nil, &http.Cookie{Name: CookieName, Value: "forged"}),
+		"unknown bearer": getMe(h, "Bearer forged"),
+		"empty bearer":   getMe(h, "Bearer "),
+		"basic auth":     getMe(h, "Basic "+c.Value),
+		"hash as token":  getMe(h, "Bearer "+HashToken(c.Value)),
+	}
+	srv.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	cases["expired"] = getMe(h, "Bearer "+c.Value)
+
+	for name, rec := range cases {
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: got %d, want 401", name, rec.Code)
+		}
+		if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Fatalf("%s: WWW-Authenticate %q", name, rec.Header().Get("WWW-Authenticate"))
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
+			t.Fatalf("%s: body %s", name, rec.Body)
+		}
+		if strings.Contains(rec.Body.String(), "ada@example.com") {
+			t.Fatalf("%s: profile leaked", name)
+		}
+	}
+	// The expired session row is purged.
+	if mem.SessionCount() != 0 {
+		t.Fatalf("expired session kept: %d rows", mem.SessionCount())
 	}
 }
 

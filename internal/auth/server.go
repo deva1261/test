@@ -30,6 +30,10 @@ type Config struct {
 	BcryptCost   int           // clamped to >= MinBcryptCost
 	SessionTTL   time.Duration // absolute session lifetime
 	CookieSecure bool          // Secure attribute on the session cookie
+	// LoginLimiter throttles POST /api/auth/login per client IP (RSK-001);
+	// nil disables it. ClientIP says which proxies' X-Forwarded-For to trust.
+	LoginLimiter RateLimiter
+	ClientIP     ClientIP
 }
 
 // Server serves the /api/auth/* endpoints and the minimal login/dashboard pages.
@@ -57,9 +61,9 @@ func NewServer(s store.Store, cfg Config) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/signup", s.signup)
-	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/login", s.rateLimit(s.login))
 	mux.Handle("GET /api/auth/me", s.requireSession(http.HandlerFunc(s.me)))
-	mux.Handle("POST /api/auth/logout", s.requireSession(http.HandlerFunc(s.logout)))
+	mux.Handle("POST /api/auth/logout", s.clearSession(s.requireSession(http.HandlerFunc(s.logout))))
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.Handle("GET "+DashboardPath, s.requireSession(http.HandlerFunc(s.dashboardPage)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -126,24 +130,32 @@ func sessionToken(r *http.Request) string {
 	if c, err := r.Cookie(CookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	// The auth scheme is case-insensitive (RFC 9110 §11.1).
+	if scheme, tok, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+		return strings.TrimSpace(tok)
 	}
 	return ""
 }
 
-// requireSession rejects requests without a live session with 401.
+// unauthorized answers 401 with the challenge RFC 9110 requires.
+func unauthorized(w http.ResponseWriter, msg string) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="auth"`)
+	writeError(w, http.StatusUnauthorized, msg)
+}
+
+// requireSession rejects requests without a live session with 401
+// (REQ-006 steps: select session by token hash, then select user by id).
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := sessionToken(r)
 		if tok == "" {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		hash := HashToken(tok)
 		sess, err := s.store.GetSessionByTokenHash(r.Context(), hash)
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		if err != nil {
@@ -152,12 +164,12 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		}
 		if !s.now().Before(sess.ExpiresAt) {
 			s.store.DeleteSessionByTokenHash(r.Context(), hash) //nolint:errcheck
-			writeError(w, http.StatusUnauthorized, "session expired")
+			unauthorized(w, "session expired")
 			return
 		}
 		user, err := s.store.GetUserByID(r.Context(), sess.UserID)
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		if err != nil {
@@ -230,10 +242,20 @@ func validEmail(e string) bool {
 	return err == nil && a.Address == e && strings.Contains(e[strings.LastIndex(e, "@"):], ".")
 }
 
+// LoginFailedMessage is the single, generic error for every failed login, so
+// responses never reveal whether the email exists (REQ-004).
+const LoginFailedMessage = "invalid email or password"
+
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	form := isForm(r)
+	// Neither the session cookie nor the Session body may be cached.
+	w.Header().Set("Cache-Control", "no-store")
 	var email, password string
 	if err := decode(r, map[string]*string{"email": &email, "password": &password}); err != nil {
+		if form {
+			s.loginFailed(w, r, form)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -287,19 +309,49 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sess)
 }
 
-func (s *Server) loginFailed(w http.ResponseWriter, r *http.Request, form bool) {
+// loginFailed answers every failed login with 401 and the same generic
+// message: JSON for API clients, the login page with an alert for browsers.
+func (s *Server) loginFailed(w http.ResponseWriter, _ *http.Request, form bool) {
 	if form {
-		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		loginTmpl.Execute(w, loginFailedAlert) //nolint:errcheck
 		return
 	}
-	writeError(w, http.StatusUnauthorized, "invalid email or password")
+	writeError(w, http.StatusUnauthorized, LoginFailedMessage)
 }
 
+// me is OP-003 (REQ-006): the session's user, serialised without
+// password_hash (store.User tags it json:"-").
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(ctxKey{}).(authed)
+	// Per-user data: shared caches must not store or replay it.
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, a.user)
 }
 
+// clearSession expires the client's session cookie on every logout response,
+// including the 401 for a stale or unknown token, so the browser never keeps
+// a dead cookie. The attributes match the login cookie so it is replaced.
+func (s *Server) clearSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.SetCookie(w, &http.Cookie{
+			Name:     CookieName,
+			Value:    "",
+			Path:     "/",
+			Expires:  time.Unix(0, 0),
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   s.cfg.CookieSecure,
+			SameSite: http.SameSiteLaxMode,
+		})
+		next.ServeHTTP(w, r)
+	})
+}
+
+// logout is OP-004 (REQ-007): deletes only the presented session's row;
+// the user's other sessions stay valid. The cookie is cleared by clearSession.
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(ctxKey{}).(authed)
 	if err := s.store.DeleteSessionByTokenHash(r.Context(), a.tokenHash); err != nil &&
@@ -307,16 +359,6 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieName,
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   s.cfg.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-	})
 	if isForm(r) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
@@ -326,10 +368,14 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 // ---- minimal pages (stand-in for auth-frontend) ----
 
+// loginFailedAlert is the login page's alert after a failed sign-in.
+const loginFailedAlert = "Invalid email or password."
+
+// loginTmpl takes the alert text to show, or "" for none.
 var loginTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Sign in</title></head><body>
 <h1>Sign in</h1>
-{{if .}}<p role="alert">Invalid email or password.</p>{{end}}
+{{if .}}<p role="alert">{{.}}</p>{{end}}
 <form method="post" action="/api/auth/login">
 <label>Email <input type="email" name="email" required></label>
 <label>Password <input type="password" name="password" required></label>
@@ -345,7 +391,11 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	loginTmpl.Execute(w, r.URL.Query().Get("error") != "") //nolint:errcheck
+	alert := ""
+	if r.URL.Query().Get("error") != "" {
+		alert = loginFailedAlert
+	}
+	loginTmpl.Execute(w, alert) //nolint:errcheck
 }
 
 func (s *Server) dashboardPage(w http.ResponseWriter, r *http.Request) {

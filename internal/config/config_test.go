@@ -74,6 +74,10 @@ func TestInvalidValues(t *testing.T) {
 		"ttl":         {"SESSION_TTL": "-1h"},
 		"ttl-parse":   {"SESSION_TTL": "forever"},
 		"cookie-bool": {"COOKIE_SECURE": "maybe"},
+		"rate-neg":    {"LOGIN_RATE_LIMIT": "-1"},
+		"rate-nan":    {"LOGIN_RATE_LIMIT": "lots"},
+		"window":      {"LOGIN_RATE_WINDOW": "0s"},
+		"proxies":     {"TRUSTED_PROXIES": "10.0.0.0/8,not-an-ip"},
 	} {
 		env["DATABASE_URL"] = devDSN
 		if _, err := load(t, env, nil); err == nil {
@@ -91,10 +95,11 @@ func TestDeployedBaseline(t *testing.T) {
 			t.Fatalf("%s: secure config rejected: %v", env, err)
 		}
 		cases := map[string]map[string]string{
-			"cookie": {"COOKIE_SECURE": "false"},
-			"cost":   {"BCRYPT_COST": "10"},
-			"tls":    {"DATABASE_URL": devDSN},
-			"no-ssl": {"DATABASE_URL": "postgres://u:p@h/db"},
+			"cookie":        {"COOKIE_SECURE": "false"},
+			"cost":          {"BCRYPT_COST": "10"},
+			"tls":           {"DATABASE_URL": devDSN},
+			"no-ssl":        {"DATABASE_URL": "postgres://u:p@h/db"},
+			"no-rate-limit": {"LOGIN_RATE_LIMIT": "0"},
 		}
 		for name, over := range cases {
 			e := base(env)
@@ -114,6 +119,34 @@ func TestDeployedBaseline(t *testing.T) {
 	// development keeps the relaxed local defaults
 	if _, err := load(t, map[string]string{"DATABASE_URL": devDSN, "COOKIE_SECURE": "false", "BCRYPT_COST": "10"}, nil); err != nil {
 		t.Fatalf("development: %v", err)
+	}
+}
+
+func TestLoginRateLimit(t *testing.T) {
+	c, err := load(t, map[string]string{"DATABASE_URL": devDSN}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LoginRateLimit != 5 || c.LoginRateWindow != time.Minute || len(c.TrustedProxies) != 0 {
+		t.Fatalf("rate limit defaults: %+v", c)
+	}
+	c, err = load(t, map[string]string{
+		"DATABASE_URL":      devDSN,
+		"LOGIN_RATE_LIMIT":  "0",
+		"LOGIN_RATE_WINDOW": "30s",
+		"TRUSTED_PROXIES":   " 127.0.0.1, 172.16.0.0/12 ,::1,10.1.2.3/8",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"127.0.0.1/32", "172.16.0.0/12", "::1/128", "10.0.0.0/8"}
+	if c.LoginRateLimit != 0 || c.LoginRateWindow != 30*time.Second || len(c.TrustedProxies) != len(want) {
+		t.Fatalf("parsed: %+v", c)
+	}
+	for i, p := range c.TrustedProxies {
+		if p.String() != want[i] {
+			t.Errorf("proxy %d: got %s, want %s", i, p, want[i])
+		}
 	}
 }
 
