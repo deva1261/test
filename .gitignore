@@ -11,6 +11,8 @@ coverage.*
 .env
 .env.*
 !.env.example
+deploy/secrets/*
+!deploy/secrets/.gitkeep
 
 # editors / OS
 .idea/
