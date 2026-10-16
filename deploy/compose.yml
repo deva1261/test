@@ -25,6 +25,10 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
+    # Cap bcrypt CPU (RSK-001) so a login storm cannot starve the bundled
+    # Postgres or the host; Go sizes GOMAXPROCS to this limit. A single host
+    # cannot autoscale: use deploy/k8s (CPU-driven HPA) when one box is not enough.
+    cpus: ${API_CPUS:-2}
     healthcheck:
       test: ["CMD", "/server", "-healthcheck"]
       interval: 10s

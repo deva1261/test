@@ -30,6 +30,10 @@ type Config struct {
 	BcryptCost   int           // clamped to >= MinBcryptCost
 	SessionTTL   time.Duration // absolute session lifetime
 	CookieSecure bool          // Secure attribute on the session cookie
+	// LoginLimiter throttles POST /api/auth/login per client IP (RSK-001);
+	// nil disables it. ClientIP says which proxies' X-Forwarded-For to trust.
+	LoginLimiter RateLimiter
+	ClientIP     ClientIP
 }
 
 // Server serves the /api/auth/* endpoints and the minimal login/dashboard pages.
@@ -57,7 +61,7 @@ func NewServer(s store.Store, cfg Config) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/signup", s.signup)
-	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/login", s.rateLimit(s.login))
 	mux.Handle("GET /api/auth/me", s.requireSession(http.HandlerFunc(s.me)))
 	mux.Handle("POST /api/auth/logout", s.requireSession(http.HandlerFunc(s.logout)))
 	mux.HandleFunc("GET /login", s.loginPage)
@@ -303,7 +307,7 @@ func (s *Server) loginFailed(w http.ResponseWriter, _ *http.Request, form bool) 
 	if form {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
-		loginTmpl.Execute(w, true) //nolint:errcheck
+		loginTmpl.Execute(w, loginFailedAlert) //nolint:errcheck
 		return
 	}
 	writeError(w, http.StatusUnauthorized, LoginFailedMessage)
@@ -340,10 +344,14 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 // ---- minimal pages (stand-in for auth-frontend) ----
 
+// loginFailedAlert is the login page's alert after a failed sign-in.
+const loginFailedAlert = "Invalid email or password."
+
+// loginTmpl takes the alert text to show, or "" for none.
 var loginTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Sign in</title></head><body>
 <h1>Sign in</h1>
-{{if .}}<p role="alert">Invalid email or password.</p>{{end}}
+{{if .}}<p role="alert">{{.}}</p>{{end}}
 <form method="post" action="/api/auth/login">
 <label>Email <input type="email" name="email" required></label>
 <label>Password <input type="password" name="password" required></label>
@@ -359,7 +367,11 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	loginTmpl.Execute(w, r.URL.Query().Get("error") != "") //nolint:errcheck
+	alert := ""
+	if r.URL.Query().Get("error") != "" {
+		alert = loginFailedAlert
+	}
+	loginTmpl.Execute(w, alert) //nolint:errcheck
 }
 
 func (s *Server) dashboardPage(w http.ResponseWriter, r *http.Request) {

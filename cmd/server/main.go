@@ -62,9 +62,14 @@ func run() error {
 		return err
 	}
 
-	srv := auth.NewServer(store.NewPostgres(pool), auth.Config{
+	authCfg := auth.Config{
 		BcryptCost: cfg.BcryptCost, SessionTTL: cfg.SessionTTL, CookieSecure: cfg.CookieSecure,
-	})
+		ClientIP: auth.ClientIP{Trusted: cfg.TrustedProxies},
+	}
+	if cfg.LoginRateLimit > 0 {
+		authCfg.LoginLimiter = auth.NewMemoryLimiter(cfg.LoginRateLimit, cfg.LoginRateWindow)
+	}
+	srv := auth.NewServer(store.NewPostgres(pool), authCfg)
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           routes(srv.Routes(), pool.Ping),

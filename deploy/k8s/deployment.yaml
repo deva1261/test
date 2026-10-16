@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authservice
+spec:
+  # No `replicas`: the HorizontalPodAutoscaler owns the count.
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: authservice
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: authservice-config
+          env:
+            - name: DATABASE_URL_FILE
+              value: /run/secrets/database_url
+          volumeMounts:
+            - name: db
+              mountPath: /run/secrets
+              readOnly: true
+          # The HPA scales on CPU utilisation relative to this request; one
+          # bcrypt cost-12 compare is ~250ms of a core.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: db
+          secret:
+            secretName: authservice-db
+            items:
+              - key: database_url
+                path: database_url
