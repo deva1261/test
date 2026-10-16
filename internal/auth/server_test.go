@@ -381,6 +381,125 @@ func TestLogoutClearsCookieAndInvalidatesSession(t *testing.T) {
 	}
 }
 
+// ---- WI-005: logout ----
+
+func postLogout(h http.Handler, contentType, bearer string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "/api/auth/logout", strings.NewReader(""))
+	req.Header.Set("Content-Type", contentType)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// assertCookieCleared checks the response expires the session cookie with
+// the same scope/attributes as the login cookie, so the browser drops it.
+func assertCookieCleared(t *testing.T, name string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	c := sessionCookie(t, rec)
+	if c.Value != "" || c.MaxAge >= 0 || c.Path != "/" || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("%s: cookie not cleared: %+v", name, c)
+	}
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "Max-Age=0") {
+		t.Fatalf("%s: Set-Cookie %q lacks Max-Age=0", name, rec.Header().Get("Set-Cookie"))
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("%s: Cache-Control %q", name, cc)
+	}
+}
+
+// WI-005 AC1 + AC2 for each way a client can log out.
+func TestLogoutVariants(t *testing.T) {
+	cases := map[string]struct {
+		do           func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder
+		wantStatus   int
+		wantLocation string
+	}{
+		"json cookie": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/json", "", c)
+		}, http.StatusOK, ""},
+		"bearer header": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/json", c.Value)
+		}, http.StatusOK, ""},
+		"dashboard form": {func(h http.Handler, c *http.Cookie) *httptest.ResponseRecorder {
+			return postLogout(h, "application/x-www-form-urlencoded", "", c)
+		}, http.StatusSeeOther, "/login"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, mem, h := newTestServer(t)
+			doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+			c := login(t, h, "ada@example.com")
+
+			rec := tc.do(h, c)
+			if rec.Code != tc.wantStatus || rec.Header().Get("Location") != tc.wantLocation {
+				t.Fatalf("got %d Location %q, want %d %q", rec.Code, rec.Header().Get("Location"), tc.wantStatus, tc.wantLocation)
+			}
+			assertCookieCleared(t, name, rec)
+			if mem.SessionCount() != 0 {
+				t.Fatalf("session row kept: %d", mem.SessionCount())
+			}
+			if rec := getMe(h, "Bearer "+c.Value); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("me after logout: got %d, want 401", rec.Code)
+			}
+			if rec := doJSON(t, h, "GET", DashboardPath, nil, c); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("dashboard after logout: got %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+// Logout ends only the presented session; other devices stay signed in.
+func TestLogoutKeepsOtherSessions(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	laptop := login(t, h, "ada@example.com")
+	phone := login(t, h, "ada@example.com")
+
+	if rec := postLogout(h, "application/json", "", laptop); rec.Code != http.StatusOK {
+		t.Fatalf("logout: got %d", rec.Code)
+	}
+	if mem.SessionCount() != 1 {
+		t.Fatalf("got %d sessions, want 1", mem.SessionCount())
+	}
+	if rec := doJSON(t, h, "GET", "/api/auth/me", nil, phone); rec.Code != http.StatusOK {
+		t.Fatalf("other session: got %d, want 200", rec.Code)
+	}
+}
+
+// Logout without a live session is 401, but a stale cookie is still cleared.
+func TestLogoutUnauthenticated(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	c := login(t, h, "ada@example.com")
+
+	cases := map[string]*httptest.ResponseRecorder{
+		"no credentials": postLogout(h, "application/json", ""),
+		"forged cookie":  postLogout(h, "application/json", "", &http.Cookie{Name: CookieName, Value: "forged"}),
+		"forged bearer":  postLogout(h, "application/json", "forged"),
+	}
+	srv.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	cases["expired cookie"] = postLogout(h, "application/json", "", c)
+
+	for name, rec := range cases {
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: got %d, want 401", name, rec.Code)
+		}
+		if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Fatalf("%s: WWW-Authenticate %q", name, rec.Header().Get("WWW-Authenticate"))
+		}
+		assertCookieCleared(t, name, rec)
+	}
+	if mem.SessionCount() != 0 {
+		t.Fatalf("expired session kept: %d rows", mem.SessionCount())
+	}
+}
+
 func TestProtectedRoutesWithoutSession(t *testing.T) {
 	_, _, h := newTestServer(t)
 	for _, r := range []struct{ method, path string }{

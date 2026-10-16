@@ -63,7 +63,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/signup", s.signup)
 	mux.HandleFunc("POST /api/auth/login", s.rateLimit(s.login))
 	mux.Handle("GET /api/auth/me", s.requireSession(http.HandlerFunc(s.me)))
-	mux.Handle("POST /api/auth/logout", s.requireSession(http.HandlerFunc(s.logout)))
+	mux.Handle("POST /api/auth/logout", s.clearSession(s.requireSession(http.HandlerFunc(s.logout))))
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.Handle("GET "+DashboardPath, s.requireSession(http.HandlerFunc(s.dashboardPage)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -330,6 +330,28 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.user)
 }
 
+// clearSession expires the client's session cookie on every logout response,
+// including the 401 for a stale or unknown token, so the browser never keeps
+// a dead cookie. The attributes match the login cookie so it is replaced.
+func (s *Server) clearSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.SetCookie(w, &http.Cookie{
+			Name:     CookieName,
+			Value:    "",
+			Path:     "/",
+			Expires:  time.Unix(0, 0),
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   s.cfg.CookieSecure,
+			SameSite: http.SameSiteLaxMode,
+		})
+		next.ServeHTTP(w, r)
+	})
+}
+
+// logout is OP-004 (REQ-007): deletes only the presented session's row;
+// the user's other sessions stay valid. The cookie is cleared by clearSession.
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(ctxKey{}).(authed)
 	if err := s.store.DeleteSessionByTokenHash(r.Context(), a.tokenHash); err != nil &&
@@ -337,16 +359,6 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieName,
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   s.cfg.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-	})
 	if isForm(r) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
