@@ -130,24 +130,32 @@ func sessionToken(r *http.Request) string {
 	if c, err := r.Cookie(CookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	// The auth scheme is case-insensitive (RFC 9110 §11.1).
+	if scheme, tok, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+		return strings.TrimSpace(tok)
 	}
 	return ""
 }
 
-// requireSession rejects requests without a live session with 401.
+// unauthorized answers 401 with the challenge RFC 9110 requires.
+func unauthorized(w http.ResponseWriter, msg string) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="auth"`)
+	writeError(w, http.StatusUnauthorized, msg)
+}
+
+// requireSession rejects requests without a live session with 401
+// (REQ-006 steps: select session by token hash, then select user by id).
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := sessionToken(r)
 		if tok == "" {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		hash := HashToken(tok)
 		sess, err := s.store.GetSessionByTokenHash(r.Context(), hash)
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		if err != nil {
@@ -156,12 +164,12 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		}
 		if !s.now().Before(sess.ExpiresAt) {
 			s.store.DeleteSessionByTokenHash(r.Context(), hash) //nolint:errcheck
-			writeError(w, http.StatusUnauthorized, "session expired")
+			unauthorized(w, "session expired")
 			return
 		}
 		user, err := s.store.GetUserByID(r.Context(), sess.UserID)
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "not authenticated")
+			unauthorized(w, "not authenticated")
 			return
 		}
 		if err != nil {
@@ -313,8 +321,12 @@ func (s *Server) loginFailed(w http.ResponseWriter, _ *http.Request, form bool) 
 	writeError(w, http.StatusUnauthorized, LoginFailedMessage)
 }
 
+// me is OP-003 (REQ-006): the session's user, serialised without
+// password_hash (store.User tags it json:"-").
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(ctxKey{}).(authed)
+	// Per-user data: shared caches must not store or replay it.
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, a.user)
 }
 

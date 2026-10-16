@@ -21,7 +21,7 @@ with stateful, database-stored sessions (no JWT).
 ## Endpoints
 - `POST /api/auth/signup` — JSON `{name,email,password,confirm_password?}` → 201 User | 400 | 409 duplicate email.
 - `POST /api/auth/login` — JSON → 200 Session + cookie | 401 `{"error": LoginFailedMessage}` (400 only for a malformed JSON body) | 429 `{"error": RateLimitedMessage}` + `Retry-After` (form: 429 login page with alert) once a client IP exceeds `LOGIN_RATE_LIMIT` per `LOGIN_RATE_WINDOW` (default 5/min; all attempts count, checked before body parsing/bcrypt). Form-encoded (browser) → 303 to `/dashboard`, or 401 with the login page and its generic alert. Every login response has `Cache-Control: no-store`. The raw token is only ever in the cookie; the Session body has `token_hash`.
-- `GET /api/auth/me` — 200 User | 401. `POST /api/auth/logout` — deletes session row, expires cookie → 200 (form: 303 `/login`) | 401.
+- `GET /api/auth/me` (WI-004) — 200 User `{id,name,email,created_at}` with `Cache-Control: no-store` | 401 `{"error"}` for missing/unknown/expired tokens (expired rows are deleted on sight). Every `requireSession` 401 carries `WWW-Authenticate: Bearer realm="auth"` (via `unauthorized()`); the Bearer scheme is matched case-insensitively, and the cookie wins over the header when both are sent. `POST /api/auth/logout` — deletes session row, expires cookie → 200 (form: 303 `/login`) | 401.
 - `GET /login`, `GET /dashboard` (protected, 401 without session), `GET /healthz` (liveness), `GET /readyz` (DB ping, 503 if down; wired in `cmd/server`).
 - `server -healthcheck` probes local `/healthz` (the distroless image has no curl).
 

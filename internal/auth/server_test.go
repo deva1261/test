@@ -392,6 +392,97 @@ func TestProtectedRoutesWithoutSession(t *testing.T) {
 	}
 }
 
+// ---- WI-004: current user ----
+
+func getMe(h http.Handler, header string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", "/api/auth/me", nil)
+	if header != "" {
+		req.Header.Set("Authorization", header)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// WI-004 AC1: the profile is the session's user with no password hash field.
+func TestMeProfileOmitsPasswordHash(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	doJSON(t, h, "POST", "/api/auth/signup", map[string]string{"name": "Bob", "email": "bob@example.com", "password": "correct-horse"})
+	u, _ := mem.GetUserByEmail(context.Background(), "ada@example.com")
+	c := login(t, h, "ada@example.com")
+
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"cookie": doJSON(t, h, "GET", "/api/auth/me", nil, c),
+		"bearer": getMe(h, "Bearer "+c.Value),
+		"BEARER": getMe(h, "bearer "+c.Value),
+	} {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: got %d %s", name, rec.Code, rec.Body)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("%s: content-type %q", name, ct)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Fatalf("%s: Cache-Control %q", name, cc)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 4 || got["id"] != u.ID.String() || got["name"] != "Ada" ||
+			got["email"] != "ada@example.com" || got["created_at"] == nil {
+			t.Fatalf("%s: unexpected body %v", name, got)
+		}
+		for _, k := range []string{"password_hash", "passwordHash", "PasswordHash"} {
+			if _, leaked := got[k]; leaked {
+				t.Fatalf("%s: %s returned", name, k)
+			}
+		}
+		if strings.Contains(rec.Body.String(), u.PasswordHash) {
+			t.Fatalf("%s: hash value leaked", name)
+		}
+	}
+}
+
+// WI-004 AC2: missing, unknown, malformed or expired tokens all get 401.
+func TestMeUnauthenticatedReturns401(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	c := login(t, h, "ada@example.com")
+
+	cases := map[string]*httptest.ResponseRecorder{
+		"no credentials": getMe(h, ""),
+		"unknown cookie": doJSON(t, h, "GET", "/api/auth/me", nil, &http.Cookie{Name: CookieName, Value: "forged"}),
+		"unknown bearer": getMe(h, "Bearer forged"),
+		"empty bearer":   getMe(h, "Bearer "),
+		"basic auth":     getMe(h, "Basic "+c.Value),
+		"hash as token":  getMe(h, "Bearer "+HashToken(c.Value)),
+	}
+	srv.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	cases["expired"] = getMe(h, "Bearer "+c.Value)
+
+	for name, rec := range cases {
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: got %d, want 401", name, rec.Code)
+		}
+		if !strings.HasPrefix(rec.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Fatalf("%s: WWW-Authenticate %q", name, rec.Header().Get("WWW-Authenticate"))
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
+			t.Fatalf("%s: body %s", name, rec.Body)
+		}
+		if strings.Contains(rec.Body.String(), "ada@example.com") {
+			t.Fatalf("%s: profile leaked", name)
+		}
+	}
+	// The expired session row is purged.
+	if mem.SessionCount() != 0 {
+		t.Fatalf("expired session kept: %d rows", mem.SessionCount())
+	}
+}
+
 func TestExpiredSessionRejected(t *testing.T) {
 	srv, _, h := newTestServer(t)
 	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
