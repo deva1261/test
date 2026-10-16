@@ -115,6 +115,113 @@ func TestSignupValidation(t *testing.T) {
 	}
 }
 
+// ---- WI-002: signup ----
+
+func signupForm(name, email, password, confirm string) url.Values {
+	return url.Values{"name": {name}, "email": {email}, "password": {password}, "confirm_password": {confirm}}
+}
+
+// WI-002 AC1-4: each invalid field gets a 400 naming that field and its message.
+func TestSignupValidationErrorsNameTheField(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	cases := []struct {
+		name        string
+		body        map[string]string
+		field, want string
+	}{
+		{"empty name", map[string]string{"name": "   ", "email": "a@example.com", "password": "correct-horse"}, "name", SignupNameRequired},
+		{"invalid email", map[string]string{"name": "A", "email": "a@b", "password": "correct-horse"}, "email", SignupInvalidEmail},
+		{"email with display name", map[string]string{"name": "A", "email": "A <a@example.com>", "password": "correct-horse"}, "email", SignupInvalidEmail},
+		{"7-char password", map[string]string{"name": "A", "email": "a@example.com", "password": "1234567"}, "password", SignupPasswordLength},
+		{"73-byte password", map[string]string{"name": "A", "email": "a@example.com", "password": strings.Repeat("x", 73)}, "password", SignupPasswordLength},
+		{"mismatch", map[string]string{"name": "A", "email": "a@example.com", "password": "correct-horse", "confirm_password": "correct-horsf"}, "confirm_password", SignupPasswordMismatch},
+		{"camelCase mismatch", map[string]string{"name": "A", "email": "a@example.com", "password": "correct-horse", "confirmPassword": "nope-nope-nope"}, "confirm_password", SignupPasswordMismatch},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := doJSON(t, h, "POST", "/api/auth/signup", c.body)
+			var got map[string]string
+			json.Unmarshal(rec.Body.Bytes(), &got) //nolint:errcheck
+			if rec.Code != http.StatusBadRequest || got["field"] != c.field || got["error"] != c.want {
+				t.Fatalf("got %d %v, want 400 %s %q", rec.Code, got, c.field, c.want)
+			}
+		})
+	}
+	if _, err := mem.GetUserByEmail(context.Background(), "a@example.com"); err == nil {
+		t.Fatal("invalid signup created a user")
+	}
+	// Exactly 8 characters is accepted, and confirmPassword works as an alias.
+	rec := doJSON(t, h, "POST", "/api/auth/signup", map[string]string{"name": "A", "email": "a@example.com", "password": "12345678", "confirmPassword": "12345678"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("8-char password: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// WI-002 AC1-4: the signup page shows the server's validation error and keeps
+// the entered name/email (never the password).
+func TestSignupFormShowsValidationError(t *testing.T) {
+	_, _, h := newTestServer(t)
+	page := doJSON(t, h, "GET", "/signup", nil)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `action="/api/auth/signup"`) ||
+		!strings.Contains(page.Body.String(), `name="confirm_password"`) || strings.Contains(page.Body.String(), `role="alert"`) {
+		t.Fatalf("signup page: %d %s", page.Code, page.Body)
+	}
+	cases := map[string]struct {
+		form url.Values
+		want string
+	}{
+		"empty name":     {signupForm("", "a@example.com", "correct-horse", "correct-horse"), SignupNameRequired},
+		"invalid email":  {signupForm("Ada", "not-an-email", "correct-horse", "correct-horse"), SignupInvalidEmail},
+		"short password": {signupForm("Ada", "a@example.com", "short", "short"), SignupPasswordLength},
+		"mismatch":       {signupForm("Ada", "a@example.com", "correct-horse", "other-horse"), SignupPasswordMismatch},
+		// A form always carries the confirmation, so leaving it blank is a mismatch.
+		"blank confirm": {signupForm("Ada", "a@example.com", "correct-horse", ""), SignupPasswordMismatch},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := postForm(h, "/api/auth/signup", c.form)
+			body := rec.Body.String()
+			if rec.Code != http.StatusBadRequest || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+				t.Fatalf("got %d %q", rec.Code, rec.Header().Get("Content-Type"))
+			}
+			if !strings.Contains(body, `<p role="alert">`+c.want+`</p>`) {
+				t.Fatalf("alert %q missing: %s", c.want, body)
+			}
+			if strings.Contains(body, "correct-horse") {
+				t.Fatal("password echoed back into the page")
+			}
+		})
+	}
+	rec := postForm(h, "/api/auth/signup", signupForm("Ada <b>", "not-an-email", "correct-horse", "correct-horse"))
+	if !strings.Contains(rec.Body.String(), `value="Ada &lt;b&gt;"`) {
+		t.Fatalf("name not kept (escaped) in form: %s", rec.Body)
+	}
+}
+
+// WI-002 AC5, AC6: browser signup redirects to /login, a repeat shows 409.
+func TestSignupFormSuccessAndDuplicate(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	rec := postForm(h, "/api/auth/signup", signupForm("Ada", "ada@example.com", "correct-horse", "correct-horse"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+		t.Fatalf("got %d Location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	if _, err := mem.GetUserByEmail(context.Background(), "ada@example.com"); err != nil {
+		t.Fatalf("user not created: %v", err)
+	}
+	login(t, h, "ada@example.com")
+
+	rec = postForm(h, "/api/auth/signup", signupForm("Ada", "ADA@example.com", "correct-horse", "correct-horse"))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), SignupEmailTaken) {
+		t.Fatalf("duplicate: %d %s", rec.Code, rec.Body)
+	}
+	var got map[string]string
+	jrec := doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	json.Unmarshal(jrec.Body.Bytes(), &got) //nolint:errcheck
+	if jrec.Code != http.StatusConflict || got["error"] != SignupEmailTaken || got["field"] != "email" {
+		t.Fatalf("JSON duplicate: %d %v", jrec.Code, got)
+	}
+}
+
 // AC3, AC4
 func TestStoredPasswordIsBcryptWithMinCost(t *testing.T) {
 	_, mem, h := newTestServer(t)
@@ -132,6 +239,22 @@ func TestStoredPasswordIsBcryptWithMinCost(t *testing.T) {
 	cost, err := bcrypt.Cost([]byte(u.PasswordHash))
 	if err != nil || cost < 10 {
 		t.Fatalf("cost %d err %v", cost, err)
+	}
+}
+
+// WI-002 AC7, AC8: with the deployed default (DEC-002) the stored hash is cost 12.
+func TestSignupUsesConfiguredBcryptCost(t *testing.T) {
+	mem := store.NewMemory()
+	h := NewServer(mem, Config{BcryptCost: DefaultBcryptCost}).Routes()
+	if rec := doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com")); rec.Code != http.StatusCreated {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	u, _ := mem.GetUserByEmail(context.Background(), "ada@example.com")
+	if cost, err := bcrypt.Cost([]byte(u.PasswordHash)); err != nil || cost != DefaultBcryptCost {
+		t.Fatalf("cost %d err %v", cost, err)
+	}
+	if !CheckPassword(u.PasswordHash, "correct-horse") {
+		t.Fatal("stored hash does not verify the raw password")
 	}
 }
 
