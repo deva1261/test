@@ -64,6 +64,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.rateLimit(s.login))
 	mux.Handle("GET /api/auth/me", s.requireSession(http.HandlerFunc(s.me)))
 	mux.Handle("POST /api/auth/logout", s.clearSession(s.requireSession(http.HandlerFunc(s.logout))))
+	mux.HandleFunc("GET /signup", s.signupForm)
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.Handle("GET "+DashboardPath, s.requireSession(http.HandlerFunc(s.dashboardPage)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -186,35 +187,54 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
+// Signup error messages (REQ-001). JSON 400/409 bodies are
+// {"error": msg, "field": name}; form posts re-render the signup page with msg.
+const (
+	SignupNameRequired     = "name is required"
+	SignupInvalidEmail     = "invalid email"
+	SignupPasswordLength   = "password must be 8-72 characters"
+	SignupPasswordMismatch = "passwords do not match"
+	SignupEmailTaken       = "email already registered"
+)
+
+// OP-001 (REQ-001..003): validate, check email uniqueness, bcrypt, insert.
 func (s *Server) signup(w http.ResponseWriter, r *http.Request) {
-	var name, email, password, confirm string
+	form := isForm(r)
+	var name, email, password, confirm, confirmCamel string
 	if err := decode(r, map[string]*string{
-		"name": &name, "email": &email, "password": &password, "confirm_password": &confirm,
+		"name": &name, "email": &email, "password": &password,
+		"confirm_password": &confirm, "confirmPassword": &confirmCamel,
 	}); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		s.signupFailed(w, form, http.StatusBadRequest, "", "invalid request body", signupPage{})
 		return
+	}
+	if confirm == "" {
+		confirm = confirmCamel
 	}
 	name = strings.TrimSpace(name)
 	email = normalizeEmail(email)
+	page := signupPage{Name: name, Email: email}
+	fail := func(status int, field, msg string) { s.signupFailed(w, form, status, field, msg, page) }
 	switch {
 	case name == "":
-		writeError(w, http.StatusBadRequest, "name is required")
+		fail(http.StatusBadRequest, "name", SignupNameRequired)
 		return
 	case !validEmail(email):
-		writeError(w, http.StatusBadRequest, "invalid email")
+		fail(http.StatusBadRequest, "email", SignupInvalidEmail)
 		return
 	case len(password) < 8 || len(password) > 72: // bcrypt only uses 72 bytes
-		writeError(w, http.StatusBadRequest, "password must be 8-72 characters")
+		fail(http.StatusBadRequest, "password", SignupPasswordLength)
 		return
-	case confirm != "" && confirm != password:
-		writeError(w, http.StatusBadRequest, "passwords do not match")
+	// The signup form always sends the confirmation; JSON clients may omit it.
+	case (form || confirm != "") && confirm != password:
+		fail(http.StatusBadRequest, "confirm_password", SignupPasswordMismatch)
 		return
 	}
 
 	// REQ-002: check for an existing email first; the unique index still
 	// guards the race between this check and the insert.
 	if _, err := s.store.GetUserByEmail(r.Context(), email); err == nil {
-		writeError(w, http.StatusConflict, "email already registered")
+		fail(http.StatusConflict, "email", SignupEmailTaken)
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
 		s.internal(w, err)
@@ -228,13 +248,36 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request) {
 	}
 	u := &store.User{ID: uuid.New(), Name: name, Email: email, PasswordHash: hash}
 	if err := s.store.CreateUser(r.Context(), u); errors.Is(err, store.ErrEmailTaken) {
-		writeError(w, http.StatusConflict, "email already registered")
+		fail(http.StatusConflict, "email", SignupEmailTaken)
 		return
 	} else if err != nil {
 		s.internal(w, err)
 		return
 	}
+	if form {
+		// Browser form submission: the new account signs in next.
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	writeJSON(w, http.StatusCreated, u)
+}
+
+// signupFailed answers a rejected signup: JSON with the offending field for
+// API clients, the signup page with an alert (and the entered name/email,
+// never the password) for browsers.
+func (s *Server) signupFailed(w http.ResponseWriter, form bool, status int, field, msg string, page signupPage) {
+	if form {
+		page.Alert = msg
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
+		signupTmpl.Execute(w, page) //nolint:errcheck
+		return
+	}
+	body := map[string]string{"error": msg}
+	if field != "" {
+		body["field"] = field
+	}
+	writeJSON(w, status, body)
 }
 
 func validEmail(e string) bool {
@@ -380,7 +423,29 @@ var loginTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <label>Email <input type="email" name="email" required></label>
 <label>Password <input type="password" name="password" required></label>
 <button type="submit">Sign in</button>
-</form></body></html>`))
+</form>
+<p><a href="/signup">Create an account</a></p>
+</body></html>`))
+
+// signupPage is signupTmpl's data: the alert ("" = none) and the values to
+// keep in the form after a rejected submission.
+type signupPage struct{ Alert, Name, Email string }
+
+// signupTmpl mirrors the server rules with HTML constraints (REQ-001); the
+// server re-checks everything and renders its message in the alert.
+var signupTmpl = template.Must(template.New("signup").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Create account</title></head><body>
+<h1>Create account</h1>
+{{if .Alert}}<p role="alert">{{.Alert}}</p>{{end}}
+<form method="post" action="/api/auth/signup">
+<label>Name <input type="text" name="name" value="{{.Name}}" required></label>
+<label>Email <input type="email" name="email" value="{{.Email}}" required></label>
+<label>Password <input type="password" name="password" minlength="8" maxlength="72" required></label>
+<label>Confirm password <input type="password" name="confirm_password" minlength="8" maxlength="72" required></label>
+<button type="submit">Sign up</button>
+</form>
+<p><a href="/login">Already have an account? Sign in</a></p>
+</body></html>`))
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Dashboard</title></head><body>
@@ -396,6 +461,11 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 		alert = loginFailedAlert
 	}
 	loginTmpl.Execute(w, alert) //nolint:errcheck
+}
+
+func (s *Server) signupForm(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	signupTmpl.Execute(w, signupPage{}) //nolint:errcheck
 }
 
 func (s *Server) dashboardPage(w http.ResponseWriter, r *http.Request) {

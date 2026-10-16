@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-# Post-deploy smoke test: liveness, readiness (DB reachable) and that a
-# protected endpoint rejects anonymous callers.
+# Post-deploy smoke test: liveness, readiness (DB reachable), that signup is
+# routed and validates, and that protected endpoints reject anonymous callers.
 # Usage: ./smoke.sh https://auth.example.com
 set -eu
 base="${1:?usage: smoke.sh BASE_URL}"
@@ -17,5 +17,8 @@ check() { # check PATH EXPECTED_STATUS [METHOD]
 
 check /healthz 200
 check /readyz 200
+check /signup 200
+# An empty body is rejected by validation, so this never creates a user.
+check /api/auth/signup 400 POST
 check /api/auth/me 401
 check /api/auth/logout 401 POST
