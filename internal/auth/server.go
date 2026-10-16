@@ -230,10 +230,20 @@ func validEmail(e string) bool {
 	return err == nil && a.Address == e && strings.Contains(e[strings.LastIndex(e, "@"):], ".")
 }
 
+// LoginFailedMessage is the single, generic error for every failed login, so
+// responses never reveal whether the email exists (REQ-004).
+const LoginFailedMessage = "invalid email or password"
+
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	form := isForm(r)
+	// Neither the session cookie nor the Session body may be cached.
+	w.Header().Set("Cache-Control", "no-store")
 	var email, password string
 	if err := decode(r, map[string]*string{"email": &email, "password": &password}); err != nil {
+		if form {
+			s.loginFailed(w, r, form)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -287,12 +297,16 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sess)
 }
 
-func (s *Server) loginFailed(w http.ResponseWriter, r *http.Request, form bool) {
+// loginFailed answers every failed login with 401 and the same generic
+// message: JSON for API clients, the login page with an alert for browsers.
+func (s *Server) loginFailed(w http.ResponseWriter, _ *http.Request, form bool) {
 	if form {
-		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		loginTmpl.Execute(w, true) //nolint:errcheck
 		return
 	}
-	writeError(w, http.StatusUnauthorized, "invalid email or password")
+	writeError(w, http.StatusUnauthorized, LoginFailedMessage)
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {

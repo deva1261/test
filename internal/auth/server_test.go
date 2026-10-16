@@ -207,6 +207,132 @@ func TestBrowserLoginRedirectsToDashboard(t *testing.T) {
 	}
 }
 
+// ---- WI-003: login ----
+
+func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// WI-003 AC1: valid credentials match the stored user and create a session row.
+func TestLoginCreatesSessionForMatchedUser(t *testing.T) {
+	srv, mem, h := newTestServer(t)
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	u, _ := mem.GetUserByEmail(context.Background(), "ada@example.com")
+
+	// Email lookup is case/whitespace-insensitive, like signup.
+	rec := doJSON(t, h, "POST", "/api/auth/login", map[string]string{"email": " ADA@Example.com ", "password": "correct-horse"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control %q", cc)
+	}
+	var body store.Session
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	c := sessionCookie(t, rec)
+	sess, err := mem.GetSessionByTokenHash(context.Background(), HashToken(c.Value))
+	if err != nil {
+		t.Fatalf("session not stored: %v", err)
+	}
+	if sess.UserID != u.ID || body.UserID != u.ID || body.ID != sess.ID || body.TokenHash != sess.TokenHash {
+		t.Fatalf("session %+v body %+v user %s", sess, body, u.ID)
+	}
+	if !sess.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("expires_at %s, want now+TTL", sess.ExpiresAt)
+	}
+	// The raw token only travels in the HttpOnly cookie.
+	if strings.Contains(rec.Body.String(), c.Value) {
+		t.Fatal("raw token leaked in response body")
+	}
+	// Each login issues a fresh token.
+	if c2 := login(t, h, "ada@example.com"); c2.Value == c.Value {
+		t.Fatal("token reused across logins")
+	}
+}
+
+// WI-003 AC2, AC3: wrong password and unknown email are indistinguishable 401s.
+func TestLoginFailuresAreGeneric401(t *testing.T) {
+	_, mem, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	var bodies []string
+	for _, body := range []map[string]string{
+		{"email": "ada@example.com", "password": "wrong-password"},
+		{"email": "nobody@example.com", "password": "correct-horse"},
+		{"email": "ada@example.com", "password": ""},
+		{"email": "", "password": ""},
+	} {
+		rec := doJSON(t, h, "POST", "/api/auth/login", body)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%v: got %d, want 401", body, rec.Code)
+		}
+		bodies = append(bodies, rec.Body.String())
+	}
+	for _, b := range bodies {
+		if b != bodies[0] {
+			t.Fatalf("error bodies differ: %q vs %q", b, bodies[0])
+		}
+	}
+	if !strings.Contains(bodies[0], LoginFailedMessage) {
+		t.Fatalf("body %q", bodies[0])
+	}
+	if mem.SessionCount() != 0 {
+		t.Fatal("session created on failed login")
+	}
+}
+
+// WI-003 AC2, AC3: a failed browser login shows the generic message with 401.
+func TestBrowserLoginFailureShowsGenericError(t *testing.T) {
+	_, _, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	var pages []string
+	for _, form := range []url.Values{
+		{"email": {"ada@example.com"}, "password": {"wrong-password"}},
+		{"email": {"nobody@example.com"}, "password": {"correct-horse"}},
+	} {
+		rec := postForm(h, "/api/auth/login", form)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("got %d, want 401", rec.Code)
+		}
+		if rec.Header().Get("Set-Cookie") != "" {
+			t.Fatal("cookie set on failed login")
+		}
+		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") ||
+			!strings.Contains(rec.Body.String(), "Invalid email or password.") {
+			t.Fatalf("page: %q %s", rec.Header().Get("Content-Type"), rec.Body)
+		}
+		pages = append(pages, rec.Body.String())
+	}
+	if pages[0] != pages[1] {
+		t.Fatal("failure page reveals whether the email exists")
+	}
+}
+
+// WI-003 AC4: the session cookie carries HttpOnly, Secure, SameSite and a lifetime.
+func TestLoginCookieAttributes(t *testing.T) {
+	_, _, h := newTestServer(t)
+	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"json": doJSON(t, h, "POST", "/api/auth/login", map[string]string{"email": "ada@example.com", "password": "correct-horse"}),
+		"form": postForm(h, "/api/auth/login", url.Values{"email": {"ada@example.com"}, "password": {"correct-horse"}}),
+	} {
+		c := sessionCookie(t, rec)
+		if !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
+			t.Fatalf("%s: cookie %+v", name, c)
+		}
+		if c.MaxAge != int(time.Hour.Seconds()) || len(c.Value) < 43 {
+			t.Fatalf("%s: MaxAge %d len %d", name, c.MaxAge, len(c.Value))
+		}
+	}
+}
+
 func TestMeReturnsCurrentUser(t *testing.T) {
 	_, _, h := newTestServer(t)
 	doJSON(t, h, "POST", "/api/auth/signup", signupBody("ada@example.com"))

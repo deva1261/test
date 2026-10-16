@@ -19,7 +19,7 @@ with stateful, database-stored sessions (no JWT).
 
 ## Endpoints
 - `POST /api/auth/signup` — JSON `{name,email,password,confirm_password?}` → 201 User | 400 | 409 duplicate email.
-- `POST /api/auth/login` — JSON → 200 Session + cookie | 401. Form-encoded (browser) → 303 to `/dashboard` (or `/login?error=1`).
+- `POST /api/auth/login` — JSON → 200 Session + cookie | 401 `{"error": LoginFailedMessage}` (400 only for a malformed JSON body). Form-encoded (browser) → 303 to `/dashboard`, or 401 with the login page and its generic alert. Every login response has `Cache-Control: no-store`. The raw token is only ever in the cookie; the Session body has `token_hash`.
 - `GET /api/auth/me` — 200 User | 401. `POST /api/auth/logout` — deletes session row, expires cookie → 200 (form: 303 `/login`) | 401.
 - `GET /login`, `GET /dashboard` (protected, 401 without session), `GET /healthz` (liveness), `GET /readyz` (DB ping, 503 if down; wired in `cmd/server`).
 - `server -healthcheck` probes local `/healthz` (the distroless image has no curl).
@@ -30,6 +30,8 @@ with stateful, database-stored sessions (no JWT).
 - Session token: 32 random bytes, base64url, sent as cookie `session` (HttpOnly, Secure, SameSite=Lax, Path=/) or `Authorization: Bearer`. Only its SHA-256 hex is stored in `sessions.token_hash`.
 - `password_hash` is never serialised (`json:"-"`) even though the OpenAPI schema lists it.
 - JSON errors are `{"error": "..."}`.
+- Failed logins (wrong password, unknown email, empty fields) all give the same 401 and the same body. Unknown emails still run a bcrypt compare against `dummyHash` so timing matches. Keep this when wrapping `login` (e.g. WI-010 rate limiting should wrap `s.login` in `Routes`).
+- Handler tests use `store.Memory`; `Memory.SessionCount()` is a test-only helper outside the `Store` interface.
 - New schema changes: add a new `internal/db/migrations/000N_*.sql`; never edit applied ones.
 
 - Config: every new setting goes through `internal/config` (parse in `LoadFrom`, check in `Validate`, add to `.env.example` and `deploy/*.env`). Secrets accept `KEY` or `KEY_FILE`, never both, and are never logged.
